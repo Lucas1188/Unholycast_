@@ -1,0 +1,6 @@
+@Unholycast__HostAddress = http://0.0.0.0:6969
+
+GET {{Unholycast__HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
