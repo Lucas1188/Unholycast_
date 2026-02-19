@@ -56,7 +56,7 @@ Runs the SoCo library inside .NET using Python.NET.
 
 ## 🧩 Companion project
 
-This bridge is designed to run alongside **yt-cast-receiver-http**.
+This bridge is designed to run alongside **[yt-cast-receiver-http](https://github.com/lucas1188/yt-cast-receiver-http)**.
 
 That service:
 
@@ -81,13 +81,40 @@ ASP.NET Minimal API
         ├── Playback Store (SQLite)
         └── MP3 HTTP Streamer (range + live file growth)
 ```
-
 ---
 
-## 🐳 Docker (recommended)
+## Docker Compose (Recommended)
+```yaml
+  unholycast:
+      image: ghcr.io/lucas1188/unholycast:dotnet
+      container_name: cast-sonos
+      network_mode: host
+      command:
+        - --leader
+        - WorkroomLeader
+        - --port
+        - "6767"
+      restart: unless-stopped
+
+  yt-cast-receiver-http:
+      image: ghcr.io/lucas1188/yt-cast-receiver-http:dotnet
+      container_name: cast-receiver
+      network_mode: host
+      command:
+        - --
+        - --name
+        - 'UnholycastAll'
+        - --port
+        - "6767"
+        - --no-ui
+      depends_on:
+        - unholycast
+      restart: unless-stopped
+```
+
+## 🐳 Docker Standalone
 
 A prebuilt container is available:
-
 ```
 ghcr.io/lucas1188/unholycast:dotnet
 ```
