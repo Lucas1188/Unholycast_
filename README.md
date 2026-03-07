@@ -45,7 +45,6 @@ Think of it as a **Sonos-compatible Chromecast Audio receiver**.
 
 ### Persistence
 
-* SQLite playback database
 * Resume partially downloaded streams
 
 ### Python integration
