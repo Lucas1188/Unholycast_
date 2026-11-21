@@ -2,6 +2,23 @@
 
 namespace Unholycast_
 {
+    public record class SonosDeviceInfo
+    {
+        public required string Ip { get; init; }
+        public required string Name { get; init; }
+        public required string CoordinatorIp { get; init; }
+        public bool IsCoordinator { get; init; }
+        public int Volume { get; init; }
+        public bool Muted { get; init; }
+    }
+
+    public record class SonosGroupInfo
+    {
+        public required string CoordinatorIp { get; init; }
+        public required string CoordinatorName { get; init; }
+        public List<string> Members { get; init; } = new();
+    }
+
     public record struct Volume
     {
         public int value;
@@ -35,7 +52,7 @@ namespace Unholycast_
             using (Py.GIL())
             {
                 if (System.Net.IPAddress.TryParse(nameOrIp, out _))
-                    return soco.SoCo(nameOrIp);
+                    return nameOrIp;
 
                 dynamic all = soco.discovery.discover();
                 if (all == null)
@@ -49,6 +66,144 @@ namespace Unholycast_
                 }
             }
             return string.Empty;
+        }
+
+        public List<SonosDeviceInfo> DiscoverDevices()
+        {
+            var devices = new List<SonosDeviceInfo>();
+
+            using (Py.GIL())
+            {
+                dynamic all = soco.discovery.discover();
+                if (all == null)
+                    return devices;
+
+                foreach (dynamic dev in all)
+                {
+                    try
+                    {
+                        string ip = (string)dev.ip_address;
+                        string name = (string)dev.player_name;
+                        int volume = (int)dev.volume;
+                        bool muted = (bool)dev.mute;
+
+                        string coordinatorIp = ip;
+                        try
+                        {
+                            coordinatorIp = (string)dev.group.coordinator.ip_address;
+                        }
+                        catch
+                        {
+                            coordinatorIp = ip;
+                        }
+
+                        devices.Add(new SonosDeviceInfo
+                        {
+                            Ip = ip,
+                            Name = name,
+                            CoordinatorIp = coordinatorIp,
+                            IsCoordinator = string.Equals(ip, coordinatorIp, StringComparison.OrdinalIgnoreCase),
+                            Volume = volume,
+                            Muted = muted
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[RUNTIME] Could not map discovered device: {ex.Message}");
+                    }
+                }
+            }
+
+            return devices;
+        }
+
+        public List<SonosGroupInfo> DiscoverGroups()
+        {
+            var devices = DiscoverDevices();
+            var groups = devices
+                .GroupBy(d => d.CoordinatorIp, StringComparer.OrdinalIgnoreCase)
+                .Select(g =>
+                {
+                    var coordinator = g.FirstOrDefault(x => x.IsCoordinator) ?? g.First();
+                    return new SonosGroupInfo
+                    {
+                        CoordinatorIp = g.Key,
+                        CoordinatorName = coordinator.Name,
+                        Members = g.Select(x => x.Ip).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+                    };
+                })
+                .ToList();
+
+            return groups;
+        }
+
+        public bool JoinGroup(string memberIp, string coordinatorIp)
+        {
+            try
+            {
+                using (Py.GIL())
+                {
+                    dynamic member = soco.SoCo(memberIp);
+                    dynamic coordinator = soco.SoCo(coordinatorIp);
+                    member.join(coordinator);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[RUNTIME] Join group failed ({memberIp} -> {coordinatorIp}): {ex.Message}");
+                return false;
+            }
+        }
+
+        public bool RemoveFromGroup(string memberIp)
+        {
+            try
+            {
+                using (Py.GIL())
+                {
+                    dynamic member = soco.SoCo(memberIp);
+                    member.unjoin();
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[RUNTIME] Unjoin failed ({memberIp}): {ex.Message}");
+                return false;
+            }
+        }
+
+        public bool SetVolumeByIp(string ip, Volume volume)
+        {
+            try
+            {
+                using (Py.GIL())
+                {
+                    dynamic device = soco.SoCo(ip);
+                    device.volume = volume.value;
+                    device.mute = volume.muted;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[RUNTIME] Setting volume failed ({ip}): {ex.Message}");
+                return false;
+            }
+        }
+
+        public Volume GetVolumeByIp(string ip)
+        {
+            using (Py.GIL())
+            {
+                dynamic device = soco.SoCo(ip);
+                return new Volume
+                {
+                    value = (int)device.volume,
+                    muted = (bool)device.mute
+                };
+            }
         }
         public dynamic GetDevice(string ip)
         {

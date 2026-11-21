@@ -5,6 +5,31 @@ using static Unholycast_.PlaybackInfo;
 
 internal class Program
 {
+    private const string PlaybackUnavailableMessage = "Playback is unavailable until a leader is configured.";
+
+    private record class GroupAssignRequest
+    {
+        public required string CoordinatorIp { get; init; }
+        public List<string> MemberIps { get; init; } = new();
+    }
+
+    private record class VolumeSetRequest
+    {
+        public required string Ip { get; init; }
+        public int Level { get; init; }
+        public bool Muted { get; init; }
+    }
+
+    private record class BatchVolumeRequest
+    {
+        public List<VolumeSetRequest> Items { get; init; } = new();
+    }
+
+    private record class PresetNameRequest
+    {
+        public required string Name { get; init; }
+    }
+
     private static async Task Main(string[] args)
     {
         AppConfig config;
@@ -45,19 +70,158 @@ internal class Program
         var _store = new PlaybackStore(Path.Join(Directory.GetCurrentDirectory(), "db.db"));
 
         var _localip = IPUtils.GetLocalIp();
-        
-        dynamic dev = socoruntime.GetDevice(socoruntime.FindDevice(config.Leader));
 
-        var sonospoller = new SonosPoller(socoruntime, dev);
+        var hasLeader = !string.IsNullOrWhiteSpace(config.Leader);
+        dynamic? dev = null;
+        SonosPoller? sonospoller = null;
+        Task _poller = Task.CompletedTask;
+        UnholySonosManager? _manager = null;
+
+        if (hasLeader)
+        {
+            var leaderIp = socoruntime.FindDevice(config.Leader!);
+            if (!string.IsNullOrWhiteSpace(leaderIp))
+            {
+                dev = socoruntime.GetDevice(leaderIp);
+                sonospoller = new SonosPoller(socoruntime, dev);
 #if DEBUG
-        //sonospoller.OnPolledState += (s,p,v) => { Console.WriteLine($"[SPOLLER] Debug got state: {s} || {p} || {v}"); };
+                //sonospoller.OnPolledState += (s,p,v) => { Console.WriteLine($"[SPOLLER] Debug got state: {s} || {p} || {v}"); };
 #endif
+            }
+            else
+            {
+                Console.WriteLine($"[PROGRAM] Leader '{config.Leader}' was not discovered; dashboard-only mode enabled.");
+            }
+        }
+        else
+        {
+            Console.WriteLine("[PROGRAM] No leader configured; dashboard-only mode enabled.");
+        }
 
         var app = builder.Build();
         ShutdownToken.Token = app.Lifetime.ApplicationStopping;
+        app.UseDefaultFiles();
+        app.UseStaticFiles();
 
-        var _poller = sonospoller.Begin();
-        var _manager = new UnholySonosManager(socoruntime, dev, sonospoller);
+        var presetStore = new SonosPresetStore(DB_DIRABS);
+
+        if (sonospoller != null && dev != null)
+        {
+            var localPoller = sonospoller;
+            var localDev = dev;
+            _poller = localPoller!.Begin();
+            _manager = new UnholySonosManager(socoruntime, localDev!, localPoller!);
+        }
+
+
+        app.MapGet("/getg", () => Results.Redirect("/getg/index.html"));
+        app.MapGet("/dashboard", () => Results.Redirect("/getg/index.html"));
+
+        app.MapGet("/dashboard/api/state", () =>
+        {
+            var devices = socoruntime.DiscoverDevices();
+            var groups = socoruntime.DiscoverGroups();
+            var presets = presetStore.GetAll();
+            return Results.Ok(new { devices, groups, presets });
+        });
+
+        app.MapPost("/dashboard/api/group", async (GroupAssignRequest request) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.CoordinatorIp))
+                return Results.BadRequest(new { msg = "CoordinatorIp is required" });
+
+            var desiredMembers = request.MemberIps
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            desiredMembers.Add(request.CoordinatorIp);
+
+            var current = socoruntime.DiscoverDevices();
+            foreach (var d in current.Where(d => desiredMembers.Contains(d.Ip)))
+            {
+                if (string.Equals(d.Ip, request.CoordinatorIp, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!string.Equals(d.CoordinatorIp, request.CoordinatorIp, StringComparison.OrdinalIgnoreCase))
+                {
+                    socoruntime.JoinGroup(d.Ip, request.CoordinatorIp);
+                }
+            }
+
+            foreach (var d in current)
+            {
+                if (string.Equals(d.CoordinatorIp, request.CoordinatorIp, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(d.Ip, request.CoordinatorIp, StringComparison.OrdinalIgnoreCase)
+                    && !desiredMembers.Contains(d.Ip))
+                {
+                    socoruntime.RemoveFromGroup(d.Ip);
+                }
+            }
+
+            await Task.Delay(350);
+            return Results.Ok(new { msg = "Group assignment requested" });
+        });
+
+        app.MapPost("/dashboard/api/volume", async (BatchVolumeRequest request) =>
+        {
+            foreach (var item in request.Items)
+            {
+                var clamped = Math.Clamp(item.Level, 0, 100);
+                socoruntime.SetVolumeByIp(item.Ip, new Volume { value = clamped, muted = item.Muted });
+            }
+
+            await Task.Delay(150);
+            return Results.Ok(new { msg = "Volume updates requested" });
+        });
+
+        app.MapPost("/dashboard/api/presets/save", (PresetNameRequest request) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.Name))
+                return Results.BadRequest(new { msg = "Preset name required" });
+
+            var preset = presetStore.Save(request.Name.Trim(), socoruntime.DiscoverDevices());
+            return Results.Ok(new { msg = "Preset saved", preset });
+        });
+
+        app.MapPost("/dashboard/api/presets/apply", async (PresetNameRequest request) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.Name))
+                return Results.BadRequest(new { msg = "Preset name required" });
+
+            var preset = presetStore.Get(request.Name.Trim());
+            if (preset == null)
+                return Results.NotFound(new { msg = "Preset not found" });
+
+            var ok = await ApplyPresetAsync(socoruntime, preset, hardReset: false);
+            return ok
+                ? Results.Ok(new { msg = "Preset applied", preset = preset.Name })
+                : Results.BadRequest(new { msg = "Preset apply failed verification", preset = preset.Name });
+        });
+
+        app.MapPost("/dashboard/api/presets/reset", async (PresetNameRequest request) =>
+        {
+            if (string.IsNullOrWhiteSpace(request.Name))
+                return Results.BadRequest(new { msg = "Preset name required" });
+
+            var preset = presetStore.Get(request.Name.Trim());
+            if (preset == null)
+                return Results.NotFound(new { msg = "Preset not found" });
+
+            var ok = await ApplyPresetAsync(socoruntime, preset, hardReset: true);
+            return ok
+                ? Results.Ok(new { msg = "Preset reset complete", preset = preset.Name })
+                : Results.BadRequest(new { msg = "Preset reset failed verification", preset = preset.Name });
+        });
+
+        app.MapDelete("/dashboard/api/presets/{name}", (string name) =>
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return Results.BadRequest(new { msg = "Preset name required" });
+
+            return presetStore.Delete(name)
+                ? Results.Ok(new { msg = "Preset deleted" })
+                : Results.NotFound(new { msg = "Preset not found" });
+        });
 
 
         if (app.Environment.IsDevelopment())
@@ -65,6 +229,9 @@ internal class Program
             app.MapOpenApi();
         }
         app.MapGet("/poll", () => {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+
             var _cts = _manager.cTransportState;
             return Results.Ok( new
             {
@@ -78,6 +245,9 @@ internal class Program
         });
         app.MapGet("/pause", () =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+
             try
             {
                 _manager.PauseSonos();
@@ -94,6 +264,9 @@ internal class Program
 
         app.MapGet("/duration", () =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage, duration = 0 }, statusCode: 503);
+
             try
             {
                 // Python dict returned through pythonnet
@@ -117,6 +290,9 @@ internal class Program
 
         app.MapGet("/position", () =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+
             try
             {
                 // Python dict returned through pythonnet
@@ -135,6 +311,9 @@ internal class Program
 
         app.MapGet("/seek", async (HttpContext ctx) =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+
             try
             {
                 var q = ctx.Request.Query;
@@ -172,6 +351,9 @@ internal class Program
 
         app.MapGet("/resume", async (HttpContext ctx) =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+
             try
             {
                 _manager.ResumeSonos();
@@ -189,11 +371,17 @@ internal class Program
 
         app.MapGet("/volume", () =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage, level = 0, muted = false }, statusCode: 503);
+
             return Results.Ok(new { level = _manager.cVolume.value, _manager.cVolume.muted });
         });
 
         app.MapPost("/volume", async (HttpContext ctx) =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+
             try
             {
                 // Parse JSON body
@@ -220,6 +408,9 @@ internal class Program
 
         app.MapGet("/start", async (HttpContext ctx) =>
         {
+            if (_manager == null)
+                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+
             try
             {
                 var q = ctx.Request.Query;
@@ -304,6 +495,13 @@ internal class Program
 
         app.MapGet("/{**path:regex(.*\\.mp3$)}", async (HttpContext ctx, string path) =>
         {
+            if (_manager == null)
+            {
+                ctx.Response.StatusCode = 503;
+                await ctx.Response.WriteAsJsonAsync(new { msg = PlaybackUnavailableMessage });
+                return;
+            }
+
             Console.WriteLine($"[STREAMER] Got request from {ctx.Connection.RemoteIpAddress}");
             int BITRATE = 320_000; // bits per second
             string vName = path[0..^4];
@@ -398,7 +596,7 @@ internal class Program
                             continue;
                         }
 
-                        // File complete but short — pad the rest
+                        // File complete but short ï¿½ pad the rest
                         long pad = contentLength - written;
                         await ctx.Response.Body.WriteAsync(new byte[pad], token);
                         written += readBytes;
@@ -431,6 +629,79 @@ internal class Program
 
         await Task.WhenAll([_poller, _apptask]);
 
-        _manager.StopSonos();
+        _manager?.StopSonos();
     }
+
+        private static async Task<bool> ApplyPresetAsync(SocoRuntime runtime, SonosPreset preset, bool hardReset)
+        {
+                for (var attempt = 1; attempt <= 3; attempt++)
+                {
+                        try
+                        {
+                                var current = runtime.DiscoverDevices();
+
+                                if (hardReset)
+                                {
+                                        foreach (var d in current)
+                                        {
+                                                if (!d.IsCoordinator)
+                                                {
+                                                        runtime.RemoveFromGroup(d.Ip);
+                                                }
+                                        }
+                                        await Task.Delay(400);
+                                }
+
+                                foreach (var pd in preset.Devices)
+                                {
+                                        if (!string.Equals(pd.Ip, pd.CoordinatorIp, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                                runtime.JoinGroup(pd.Ip, pd.CoordinatorIp);
+                                        }
+                                }
+
+                                await Task.Delay(500);
+
+                                foreach (var pd in preset.Devices)
+                                {
+                                        runtime.SetVolumeByIp(pd.Ip, new Volume { value = Math.Clamp(pd.Volume, 0, 100), muted = pd.Muted });
+                                }
+
+                                await Task.Delay(350);
+
+                                if (VerifyPreset(runtime, preset))
+                                {
+                                        return true;
+                                }
+                        }
+                        catch (Exception ex)
+                        {
+                                Console.WriteLine($"[DASHBOARD] Apply preset attempt {attempt} failed: {ex.Message}");
+                        }
+                }
+
+                return false;
+        }
+
+        private static bool VerifyPreset(SocoRuntime runtime, SonosPreset preset)
+        {
+                var discovered = runtime.DiscoverDevices().ToDictionary(x => x.Ip, StringComparer.OrdinalIgnoreCase);
+                foreach (var pd in preset.Devices)
+                {
+                        if (!discovered.TryGetValue(pd.Ip, out var live))
+                                return false;
+
+                        if (!string.Equals(live.CoordinatorIp, pd.CoordinatorIp, StringComparison.OrdinalIgnoreCase))
+                                return false;
+
+                        if (Math.Abs(live.Volume - pd.Volume) > 2)
+                                return false;
+
+                        if (live.Muted != pd.Muted)
+                                return false;
+                }
+
+                return true;
+        }
+
 }

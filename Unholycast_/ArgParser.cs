@@ -1,9 +1,9 @@
 ﻿public class AppConfig
 {
-    public string Leader { get; set; }
+    public string? Leader { get; set; }
     public List<string> Followers { get; set; } = new();
     public int Port { get; set; } = 6969;
-    public string NewName { get; set; }
+    public string? NewName { get; set; }
 }
 public static class ArgParser
 {
@@ -65,10 +65,8 @@ public static class ArgParser
         // Build AppConfig
         var config = new AppConfig();
 
-        if (!dict.TryGetValue("leader", out var leader))
-            throw new ArgumentException("Missing required argument: --leader");
-
-        config.Leader = leader;
+        if (dict.TryGetValue("leader", out var leader))
+            config.Leader = leader;
 
         if (listArgs.TryGetValue("followers", out var follList))
             config.Followers = follList;

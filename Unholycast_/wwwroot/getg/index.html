@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Unholycast Sonos Dashboard</title>
+  <link rel="stylesheet" href="/getg/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <div class="title">Unholycast Group & Volume Dashboard</div>
+      <button id="refreshBtn" class="primary" type="button">Refresh Discovery</button>
+    </div>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Speakers</h2>
+        <div id="devices"></div>
+      </section>
+
+      <section class="card">
+        <h2>Group Assignment</h2>
+        <div class="row mb">
+          <label class="full">Coordinator
+            <select id="leaderSelect"></select>
+          </label>
+        </div>
+        <div class="members" id="memberList"></div>
+        <div class="row mt">
+          <button id="applyGroupBtn" class="primary" type="button">Apply Group</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Presets</h2>
+        <div class="row">
+          <input id="presetName" type="text" placeholder="Preset name" />
+          <button id="savePresetBtn" class="primary" type="button">Save Current</button>
+        </div>
+        <div id="presetList" class="mt"></div>
+      </section>
+    </div>
+
+    <div class="status" id="status"></div>
+  </div>
+
+  <script src="/getg/app.js"></script>
+</body>
+</html>
