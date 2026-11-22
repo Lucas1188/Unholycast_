@@ -151,6 +151,7 @@ internal class Program
 
                         dev = candidateDevice;
                         sonospoller = new SonosPoller(socoruntime, dev);
+                        sonospoller.OnPolledState += BroadcastPlaybackState;
                         _poller = sonospoller.Begin();
                         _manager = new UnholySonosManager(socoruntime, dev, sonospoller);
                         File.WriteAllText(leaderFile, ip);
@@ -170,14 +171,53 @@ internal class Program
 
         var app = builder.Build();
         ShutdownToken.Token = app.Lifetime.ApplicationStopping;
+        app.UseWebSockets();
         app.UseDefaultFiles();
         app.UseStaticFiles();
 
         var presetStore = new SonosPresetStore(DB_DIRABS);
         var resolverUrl = builder.Configuration["Unholycast:ResolverUrl"] ?? "http://127.0.0.1:8099/unholycast/resolve";
         var prefetch = new PrefetchService(_store, DB_DIRABS, resolverUrl);
+        var wsClients = new WebSocketHub();
+
+        void BroadcastPlaybackState(SonosTransportState state, SonosTrackInfo track, Volume volume)
+        {
+            _ = wsClients.BroadcastAsync(new
+            {
+                type = "playback",
+                transport = new
+                {
+                    state = state.current_transport_state,
+                    status = state.current_transport_status,
+                    speed = state.current_transport_speed
+                },
+                progress = new
+                {
+                    position = track.position,
+                    duration = track.duration,
+                    title = track.title
+                },
+                volume = new { level = volume.value, muted = volume.muted },
+                currentVideoId = _manager?._currentPlaying?._playbackInfo.VideoId,
+                at = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            });
+        }
 
         TryEnsurePlaybackManager(out _);
+        if (sonospoller != null)
+            sonospoller.OnPolledState += BroadcastPlaybackState;
+
+        app.MapGet("/ws/playback", async (HttpContext ctx) =>
+        {
+            if (!ctx.WebSockets.IsWebSocketRequest)
+            {
+                ctx.Response.StatusCode = 400;
+                return;
+            }
+
+            using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
+            await wsClients.AddAsync(socket, ctx.RequestAborted);
+        });
 
         app.MapGet("/getg", () => Results.Redirect("/getg/index.html"));
         app.MapGet("/dashboard", () => Results.Redirect("/getg/index.html"));
