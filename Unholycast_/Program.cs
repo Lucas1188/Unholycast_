@@ -204,8 +204,6 @@ internal class Program
         }
 
         TryEnsurePlaybackManager(out _);
-        if (sonospoller != null)
-            sonospoller.OnPolledState += BroadcastPlaybackState;
 
         app.MapGet("/ws/playback", async (HttpContext ctx) =>
         {
