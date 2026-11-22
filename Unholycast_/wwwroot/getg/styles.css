@@ -90,6 +90,7 @@ button.primary {
 }
 
 input[type="text"],
+input[type="number"],
 select {
   border: 1px solid var(--line);
   border-radius: 10px;

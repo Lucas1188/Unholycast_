@@ -160,6 +160,12 @@ Mount volumes to persist state:
 
 ## 🔌 HTTP API
 
+### Prefetch
+
+`POST /prefetch`
+
+Queues a song for background download/transcode without touching Sonos playback. The body accepts `videoId`, `title`, `duration`, `streamUrl`, `src`, `channel`, `artist`, `album`, and optional playlist context. If `streamUrl` is omitted, Unholycast asks the companion resolver at `Unholycast:ResolverUrl` (default `http://127.0.0.1:8099/unholycast/resolve`) to resolve it. Prefetch is serialized, delayed 10 seconds after playback starts, and bounded by count/size/TTL.
+
 ### Playback status
 
 `GET /poll`

@@ -20,6 +20,34 @@ async function loadState() {
   renderDevices();
   renderGroupEditor();
   renderPresets();
+  await loadPlayback();
+}
+
+async function loadPlayback() {
+  const info = await requestJson("/dashboard/api/playback");
+  const root = document.getElementById("playbackInfo");
+
+  if (!info.available) {
+    root.textContent = info.message || "Playback unavailable";
+    return;
+  }
+
+  const leader = info.leader
+    ? `${info.leader.name || "unknown"} (${info.leader.sonosIp || info.leader.ip})`
+    : "none";
+  const current = info.current
+    ? `${info.current.title || info.current.videoId} [${info.current.fileStatus}, ${info.current.bytes} bytes]`
+    : "none";
+  const track = info.track || {};
+  const transport = info.transport || {};
+  const volume = info.volume || {};
+
+  root.innerHTML = `
+    <div><strong>Status:</strong> ${transport.state || "unknown"} / ${transport.status || "unknown"}</div>
+    <div><strong>Track:</strong> ${current}</div>
+    <div><strong>Sonos metadata:</strong> ${track.title || "none"} (${track.position || 0}s / ${track.duration || 0}s)</div>
+    <div><strong>Paired leader:</strong> ${leader}</div>
+    <div><strong>Volume:</strong> ${volume.level ?? 0}${volume.muted ? " (muted)" : ""}</div>`;
 }
 
 function renderDevices() {
@@ -172,6 +200,46 @@ document.getElementById("savePresetBtn").addEventListener("click", async () => {
   });
   setStatus("Preset saved");
   await loadState();
+});
+
+document.getElementById("pauseBtn").addEventListener("click", async () => {
+  await requestJson("/pause");
+  setStatus("Paused");
+  await loadPlayback();
+});
+
+document.getElementById("resumeBtn").addEventListener("click", async () => {
+  await requestJson("/resume");
+  setStatus("Resumed");
+  await loadPlayback();
+});
+
+document.getElementById("playbackRefreshBtn").addEventListener("click", async () => {
+  await loadPlayback();
+  setStatus("Playback refreshed");
+});
+
+document.getElementById("seekBtn").addEventListener("click", async () => {
+  const pos = document.getElementById("seekPos").value;
+  if (pos === "") {
+    setStatus("Seek position required");
+    return;
+  }
+  await requestJson(`/seek?pos=${encodeURIComponent(pos)}`);
+  setStatus("Seek requested");
+  await loadPlayback();
+});
+
+document.getElementById("volumeBtn").addEventListener("click", async () => {
+  const level = Number(document.getElementById("volumeLevel").value || 0);
+  const muted = !!document.getElementById("volumeMute").checked;
+  await requestJson("/volume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ level, muted })
+  });
+  setStatus("Volume updated");
+  await loadPlayback();
 });
 
 loadState().catch((err) => setStatus(err.message));

@@ -65,8 +65,14 @@ namespace Unholycast_
             playbackStore.SetStatus(videoId, PlaybackInfo.Status.Filing);
             var args = new List<string>
             {
-                "-y","-hide_banner","-nostats","-loglevel","error",
+                "-y","-hide_banner","-nostats","-loglevel","error"
+            };
 
+            if (seek > 0)
+                args.AddRange(new[] { "-ss", seek.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+
+            args.AddRange(new[]
+            {
                 "-i", $"\"{url}\"",
 
                 "-vn","-acodec","libmp3lame","-b:a","320k",
@@ -74,12 +80,12 @@ namespace Unholycast_
 
                 "-metadata", $"title=\"{title}\"",
                 "-metadata", $"artist=\"{artist}\"",
-                "-metadata", $"duration=\"{duration}\"",
+                "-metadata", $"duration=\"{Math.Max(0, duration - seek)}\"",
                 "-metadata", $"channel=\"{channel}\"",
                 "-metadata", $"source=\"{source}\"",
 
                 $"\"{outputPath}\""
-            };
+            });
 
             Console.WriteLine($"[FFMPEG] Launching for {videoId}");//: ffmpeg {string.Join(" ", args)}");
 

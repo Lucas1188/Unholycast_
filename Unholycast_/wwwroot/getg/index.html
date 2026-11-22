@@ -15,6 +15,25 @@
 
     <div class="grid">
       <section class="card">
+        <h2>Playback</h2>
+        <div id="playbackInfo" class="muted">Loading playback state…</div>
+        <div class="row mt">
+          <button id="pauseBtn" type="button">Pause</button>
+          <button id="resumeBtn" type="button">Resume</button>
+          <button id="playbackRefreshBtn" type="button">Refresh</button>
+        </div>
+        <div class="row mt">
+          <input id="seekPos" type="number" min="0" placeholder="Seek seconds" />
+          <button id="seekBtn" type="button">Seek</button>
+        </div>
+        <div class="row mt">
+          <input id="volumeLevel" type="number" min="0" max="100" placeholder="Volume" />
+          <label><input id="volumeMute" type="checkbox" /> mute</label>
+          <button id="volumeBtn" type="button">Set Volume</button>
+        </div>
+      </section>
+
+      <section class="card">
         <h2>Speakers</h2>
         <div id="devices"></div>
       </section>

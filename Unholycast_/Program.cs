@@ -68,34 +68,104 @@ internal class Program
         SocoRuntime socoruntime = new SocoRuntime();
 
         var _store = new PlaybackStore(Path.Join(Directory.GetCurrentDirectory(), "db.db"));
+        _store.ReconcileWithFiles(DB_DIRABS);
 
         var _localip = IPUtils.GetLocalIp();
 
-        var hasLeader = !string.IsNullOrWhiteSpace(config.Leader);
         dynamic? dev = null;
         SonosPoller? sonospoller = null;
         Task _poller = Task.CompletedTask;
         UnholySonosManager? _manager = null;
+        var leaderFile = Path.Join(DB_DIRABS, "leader.txt");
+        var managerInitLock = new object();
+        var lastLeaderAttemptUtc = DateTime.MinValue;
 
-        if (hasLeader)
+        bool TryEnsurePlaybackManager(out string? error, bool force = false)
         {
-            var leaderIp = socoruntime.FindDevice(config.Leader!);
-            if (!string.IsNullOrWhiteSpace(leaderIp))
+            error = null;
+            lock (managerInitLock)
             {
-                dev = socoruntime.GetDevice(leaderIp);
-                sonospoller = new SonosPoller(socoruntime, dev);
-#if DEBUG
-                //sonospoller.OnPolledState += (s,p,v) => { Console.WriteLine($"[SPOLLER] Debug got state: {s} || {p} || {v}"); };
-#endif
+                if (_manager != null)
+                    return true;
+
+                if (!force && DateTime.UtcNow - lastLeaderAttemptUtc < TimeSpan.FromSeconds(5))
+                {
+                    error = PlaybackUnavailableMessage;
+                    return false;
+                }
+
+                lastLeaderAttemptUtc = DateTime.UtcNow;
+
+                var candidates = new List<string>();
+                if (!string.IsNullOrWhiteSpace(config.Leader))
+                    candidates.Add(config.Leader);
+
+                if (File.Exists(leaderFile))
+                {
+                    var saved = File.ReadAllText(leaderFile).Trim();
+                    if (!string.IsNullOrWhiteSpace(saved))
+                        candidates.Add(saved);
+                }
+
+                try
+                {
+                    var devices = socoruntime.DiscoverDevices();
+                    candidates.AddRange(devices.Where(x => x.IsCoordinator).Select(x => x.Ip));
+                    candidates.AddRange(devices.Select(x => x.Ip));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[PROGRAM] Leader discovery failed: {ex.Message}");
+                }
+
+                foreach (var candidate in candidates
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var ip = System.Net.IPAddress.TryParse(candidate, out _)
+                            ? candidate
+                            : socoruntime.FindDevice(candidate);
+
+                        if (string.IsNullOrWhiteSpace(ip))
+                            continue;
+
+                        dynamic candidateDevice = socoruntime.GetDevice(ip);
+                        string? coordinatorIp = null;
+                        try
+                        {
+                            coordinatorIp = (string?)candidateDevice.group.coordinator.ip_address;
+                        }
+                        catch
+                        {
+                            coordinatorIp = null;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(coordinatorIp) &&
+                            !string.Equals(ip, coordinatorIp, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ip = coordinatorIp;
+                            candidateDevice = socoruntime.GetDevice(ip);
+                        }
+
+                        dev = candidateDevice;
+                        sonospoller = new SonosPoller(socoruntime, dev);
+                        _poller = sonospoller.Begin();
+                        _manager = new UnholySonosManager(socoruntime, dev, sonospoller);
+                        File.WriteAllText(leaderFile, ip);
+                        Console.WriteLine($"[PROGRAM] Playback leader initialized: {ip}");
+                        return true;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[PROGRAM] Could not initialize leader from '{candidate}': {ex.Message}");
+                    }
+                }
+
+                error = PlaybackUnavailableMessage;
+                return false;
             }
-            else
-            {
-                Console.WriteLine($"[PROGRAM] Leader '{config.Leader}' was not discovered; dashboard-only mode enabled.");
-            }
-        }
-        else
-        {
-            Console.WriteLine("[PROGRAM] No leader configured; dashboard-only mode enabled.");
         }
 
         var app = builder.Build();
@@ -104,15 +174,10 @@ internal class Program
         app.UseStaticFiles();
 
         var presetStore = new SonosPresetStore(DB_DIRABS);
+        var resolverUrl = builder.Configuration["Unholycast:ResolverUrl"] ?? "http://127.0.0.1:8099/unholycast/resolve";
+        var prefetch = new PrefetchService(_store, DB_DIRABS, resolverUrl);
 
-        if (sonospoller != null && dev != null)
-        {
-            var localPoller = sonospoller;
-            var localDev = dev;
-            _poller = localPoller!.Begin();
-            _manager = new UnholySonosManager(socoruntime, localDev!, localPoller!);
-        }
-
+        TryEnsurePlaybackManager(out _);
 
         app.MapGet("/getg", () => Results.Redirect("/getg/index.html"));
         app.MapGet("/dashboard", () => Results.Redirect("/getg/index.html"));
@@ -123,6 +188,66 @@ internal class Program
             var groups = socoruntime.DiscoverGroups();
             var presets = presetStore.GetAll();
             return Results.Ok(new { devices, groups, presets });
+        });
+
+        app.MapGet("/dashboard/api/playback", () =>
+        {
+            if (!TryEnsurePlaybackManager(out var playbackError))
+            {
+                return Results.Ok(new
+                {
+                    available = false,
+                    message = playbackError ?? PlaybackUnavailableMessage,
+                    leader = (object?)null,
+                    transport = (object?)null,
+                    track = (object?)null,
+                    current = (object?)null,
+                    volume = (object?)null
+                });
+            }
+
+            var current = _manager!._currentPlaying?._playbackInfo;
+            var leader = dev == null ? null : new
+            {
+                ip = _localip,
+                sonosIp = (string?)dev.ip_address,
+                name = (string?)dev.player_name,
+                coordinatorIp = (string?)dev.group.coordinator.ip_address
+            };
+            var manager = _manager!;
+
+            return Results.Ok(new
+            {
+                available = true,
+                message = (string?)null,
+                leader,
+                transport = new
+                {
+                    state = manager.cTransportState?.current_transport_state,
+                    status = manager.cTransportState?.current_transport_status,
+                    speed = manager.cTransportState?.current_transport_speed
+                },
+                track = new
+                {
+                    title = manager.cTrackInfo?.title,
+                    position = manager.cTrackInfo?.position ?? 0,
+                    duration = manager.cTrackInfo?.duration ?? 0
+                },
+                current = current == null ? null : new
+                {
+                    videoId = current.VideoId,
+                    title = current.Title,
+                    duration = current.duration,
+                    bytes = current.bytes,
+                    fileStatus = current.fileStatus.ToString(),
+                    url = manager._currentPlaying?.url
+                },
+                volume = new
+                {
+                    level = manager.cVolume.value,
+                    muted = manager.cVolume.muted
+                }
+            });
         });
 
         app.MapPost("/dashboard/api/group", async (GroupAssignRequest request) =>
@@ -229,10 +354,10 @@ internal class Program
             app.MapOpenApi();
         }
         app.MapGet("/poll", () => {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var pollError))
+                return Results.Json(new { msg = pollError ?? PlaybackUnavailableMessage }, statusCode: 503);
 
-            var _cts = _manager.cTransportState;
+            var _cts = _manager!.cTransportState;
             return Results.Ok( new
             {
                 status = new
@@ -245,12 +370,12 @@ internal class Program
         });
         app.MapGet("/pause", () =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var pauseError))
+                return Results.Json(new { msg = pauseError ?? PlaybackUnavailableMessage }, statusCode: 503);
 
             try
             {
-                _manager.PauseSonos();
+                _manager!.PauseSonos();
                 // Python dict returned through pythonnet
                 return Results.Ok(new { msg = "Player paused" });
             }
@@ -264,15 +389,13 @@ internal class Program
 
         app.MapGet("/duration", () =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage, duration = 0 }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var durationError))
+                return Results.Json(new { msg = durationError ?? PlaybackUnavailableMessage, duration = 0 }, statusCode: 503);
 
             try
             {
-                // Python dict returned through pythonnet
-                //Console.WriteLine($"[INFO] [HTTP] Returning duration of {_manager._currentPlaying?._playbackInfo.Title} - ");
                 int dur = 0;
-                if (_manager._currentPlaying != null)
+                if (_manager!._currentPlaying != null)
                 {
                     dur = _manager._currentPlaying._playbackInfo.duration;
                 }
@@ -290,16 +413,14 @@ internal class Program
 
         app.MapGet("/position", () =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var positionError))
+                return Results.Json(new { msg = positionError ?? PlaybackUnavailableMessage }, statusCode: 503);
 
             try
             {
-                // Python dict returned through pythonnet
                 return Results.Ok(new
                 {
-                    _manager.cTrackInfo.position,
-                    
+                    _manager!.cTrackInfo.position
                 });
             }
             catch (Exception ex)
@@ -311,8 +432,8 @@ internal class Program
 
         app.MapGet("/seek", async (HttpContext ctx) =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var seekError))
+                return Results.Json(new { msg = seekError ?? PlaybackUnavailableMessage }, statusCode: 503);
 
             try
             {
@@ -321,7 +442,7 @@ internal class Program
                 string? seekstr = q["pos"].FirstOrDefault();
                 if (seekstr == null) return Results.BadRequest(new { msg = "Bad seek params" });
 
-                if (await _manager.TrySeek(int.Parse(seekstr)))
+                if (await _manager!.TrySeek(int.Parse(seekstr)))
                 {
                     var _cts = _manager.cTransportState;
 
@@ -351,12 +472,12 @@ internal class Program
 
         app.MapGet("/resume", async (HttpContext ctx) =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var resumeError))
+                return Results.Json(new { msg = resumeError ?? PlaybackUnavailableMessage }, statusCode: 503);
 
             try
             {
-                _manager.ResumeSonos();
+                _manager!.ResumeSonos();
                 Console.WriteLine($"[INFO] [HTTP] Resuming Playback");
                 return Results.Ok(new { msg = "Resume ok" });
             }
@@ -371,16 +492,16 @@ internal class Program
 
         app.MapGet("/volume", () =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage, level = 0, muted = false }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var volumeError))
+                return Results.Json(new { msg = volumeError ?? PlaybackUnavailableMessage, level = 0, muted = false }, statusCode: 503);
 
-            return Results.Ok(new { level = _manager.cVolume.value, _manager.cVolume.muted });
+            return Results.Ok(new { level = _manager!.cVolume.value, _manager.cVolume.muted });
         });
 
         app.MapPost("/volume", async (HttpContext ctx) =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var setVolumeError))
+                return Results.Json(new { msg = setVolumeError ?? PlaybackUnavailableMessage }, statusCode: 503);
 
             try
             {
@@ -395,7 +516,7 @@ internal class Program
                 Console.WriteLine($"[INFO] [HTTP] Setting volume: {level}, muted={muted}");
 
                 // Apply to leader (your SoCo / pythonnet object)
-                _manager.SetVolume(new() { value = level, muted = muted });
+                _manager!.SetVolume(new() { value = level, muted = muted });
 
                 return Results.Ok(new { msg = "Volume updated" });
             }
@@ -408,8 +529,8 @@ internal class Program
 
         app.MapGet("/start", async (HttpContext ctx) =>
         {
-            if (_manager == null)
-                return Results.Json(new { msg = PlaybackUnavailableMessage }, statusCode: 503);
+            if (!TryEnsurePlaybackManager(out var startError, force: true))
+                return Results.Json(new { msg = startError ?? PlaybackUnavailableMessage }, statusCode: 503);
 
             try
             {
@@ -425,6 +546,15 @@ internal class Program
                 string? album = q["album"].FirstOrDefault() ?? "";
                 string? channel = q["channel"].FirstOrDefault() ?? "";
 
+                string? nextVideoId = q["nextVideoId"].FirstOrDefault();
+                string? nextStreamUrl = q["nextStreamUrl"].FirstOrDefault();
+                string? nextTitle = q["nextTitle"].FirstOrDefault();
+                string? nextDurationS = q["nextDuration"].FirstOrDefault() ?? "0";
+                string? nextSrc = q["nextSrc"].FirstOrDefault() ?? "yt";
+                string? nextPlaylistId = q["nextPlaylistId"].FirstOrDefault();
+                string? nextParams = q["nextParams"].FirstOrDefault();
+                string? nextIndexS = q["nextIndex"].FirstOrDefault();
+                string? nextCtt = q["nextCtt"].FirstOrDefault();
 
                 if (string.IsNullOrWhiteSpace(uri))
                 {
@@ -443,7 +573,7 @@ internal class Program
                 Console.WriteLine($"[INFO] [HTTP] /start called with {videoId} - {title} : {duration} @ {seek}");
                 try
                 {
-                    _manager.StopSonos();
+                    _manager!.StopSonos();
                 }
                 catch (Exception ex)
                 {
@@ -456,28 +586,45 @@ internal class Program
                     duration = duration,
                 });
 
-                _ = Task.Run(_store.SaveDB);
+                var cacheFile = Path.Join(DB_DIRABS, $"{videoId}.mp3");
+                var cacheValid = fState == PlaybackInfo.Status.Complete &&
+                                 File.Exists(cacheFile) &&
+                                 new FileInfo(cacheFile).Length > 0;
 
-                if (fState == PlaybackInfo.Status.Incomplete)
+                if (!cacheValid)
                 {
+                    if (fState == PlaybackInfo.Status.Complete)
+                        _store.SetStatus(videoId, PlaybackInfo.Status.Incomplete);
+
                     Console.WriteLine($"[PROGRAM] Starting FFMPEG process for {videoId}");
                     FfmpegService.StartFfmpegStream(videoId, uri, seek, duration, title, source, channel, artist, album, _store);
                     await Task.Delay(500);
                 }
-                var success = await _manager.PlaySonos(_store.Store[videoId], _localip, (int)ctx.Request.Host.Port!);
+                var success = await _manager!.PlaySonos(_store.Store[videoId], _localip, (int)ctx.Request.Host.Port!);
                 if (!success)
                 {
                     Console.WriteLine($"[MANAGER] State is NOT PLAYING");
                 }
-                else
+                else if (!string.IsNullOrWhiteSpace(nextVideoId))
                 {
-                    if (seek > 0)
+                    _ = int.TryParse(nextDurationS, out var nextDuration);
+                    _ = int.TryParse(nextIndexS, out var nextIndex);
+                    _ = Task.Run(async () =>
                     {
-                        if (!await _manager.TrySeek(seek))
+                        await Task.Delay(TimeSpan.FromSeconds(10));
+                        prefetch.Enqueue(new StreamMetadataRequest
                         {
-                            Console.WriteLine($"[Manager] Seeking failed during play");
-                        }
-                    }
+                            VideoId = nextVideoId,
+                            Title = nextTitle ?? nextVideoId,
+                            Duration = nextDuration,
+                            StreamUrl = nextStreamUrl ?? "",
+                            Src = nextSrc,
+                            PlaylistId = nextPlaylistId ?? "",
+                            Params = nextParams ?? "",
+                            Index = string.IsNullOrWhiteSpace(nextIndexS) ? null : nextIndex,
+                            Ctt = nextCtt ?? ""
+                        });
+                    });
                 }
 
                 return success ? Results.Ok(new { msg = "Stream started!" }) : Results.BadRequest(new { msg = "Could not set player to start playing" });
@@ -488,6 +635,12 @@ internal class Program
                 return Results.BadRequest(new { msg = "Could not start player" });
             }
         });
+        app.MapPost("/prefetch", (StreamMetadataRequest request) =>
+        {
+            prefetch.Enqueue(request);
+            return Results.Accepted(value: new { msg = "Prefetch queued", videoId = request.VideoId });
+        });
+
         app.MapGet("/store", () =>
         {
             return Results.Ok(_store.Store);
@@ -495,10 +648,10 @@ internal class Program
 
         app.MapGet("/{**path:regex(.*\\.mp3$)}", async (HttpContext ctx, string path) =>
         {
-            if (_manager == null)
+            if (!TryEnsurePlaybackManager(out var streamError))
             {
                 ctx.Response.StatusCode = 503;
-                await ctx.Response.WriteAsJsonAsync(new { msg = PlaybackUnavailableMessage });
+                await ctx.Response.WriteAsJsonAsync(new { msg = streamError ?? PlaybackUnavailableMessage });
                 return;
             }
 
@@ -551,7 +704,7 @@ internal class Program
                 return;
             }
 
-            string contentRange = $"bytes {resumeAt}-/{guessedSize}";
+            string contentRange = $"bytes {resumeAt}-{guessedSize - 1}/{guessedSize}";
             long contentLength = guessedSize - resumeAt;
 
             ctx.Response.StatusCode = resumeAt == 0 ? 200 : 206;
@@ -576,7 +729,7 @@ internal class Program
 
                 long written = 0;
                 byte[] buffer = new byte[8192];
-                var token = _manager.GetToken();
+                var token = _manager!.GetToken();
 
                 while (!token.IsCancellationRequested && written < contentLength)
                 {
@@ -599,7 +752,7 @@ internal class Program
                         // File complete but short � pad the rest
                         long pad = contentLength - written;
                         await ctx.Response.Body.WriteAsync(new byte[pad], token);
-                        written += readBytes;
+                        written += pad;
                         Console.WriteLine($"[STREAMER] Wrote {pad} pad bytes");
                         break;
                     }

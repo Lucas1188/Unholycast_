@@ -37,7 +37,7 @@ $"""
         <dc:title>{info.Title}</dc:title>
         <dc:creator>{info.Artist}</dc:creator>
         <upnp:album>{info.Album}</upnp:album>
-        <res protocolInfo="http-get:*:audio/mpeg:*"{GetDurationFromSeconds(info.duration)}>{uri}</res>
+        <res protocolInfo="http-get:*:audio/mpeg:*" duration="{GetDurationFromSeconds(info.duration)}">{uri}</res>
         <upnp:class>object.item.audioItem.musicTrack</upnp:class>
     </item>
 </DIDL-Lite>
@@ -53,7 +53,8 @@ $"""
 
     public class PlaybackStore
     {
-        private string _filepath;
+        private readonly string _filepath;
+        private readonly SemaphoreSlim _saveLock = new(1, 1);
         public PlaybackStore(string filepath) 
         {
             if (File.Exists(filepath))
@@ -83,15 +84,55 @@ $"""
             }
         }
         public ConcurrentDictionary<string, PlaybackInfo> Store { get; private set; } = new ();
+
+        public void ReconcileWithFiles(string filesDirectory)
+        {
+            var changed = false;
+            foreach (var entry in Store)
+            {
+                var path = Path.Combine(filesDirectory, $"{entry.Key}.mp3");
+                var exists = File.Exists(path) && new FileInfo(path).Length > 0;
+
+                if (entry.Value.fileStatus == PlaybackInfo.Status.Complete && !exists)
+                {
+                    Console.WriteLine($"[PlaybackStore] Complete record {entry.Key} has no MP3; marking incomplete");
+                    entry.Value.fileStatus = PlaybackInfo.Status.Incomplete;
+                    entry.Value.bytes = 0;
+                    changed = true;
+                }
+                else if (entry.Value.fileStatus == PlaybackInfo.Status.Filing && !exists)
+                {
+                    Console.WriteLine($"[PlaybackStore] Filing record {entry.Key} has no MP3; marking incomplete");
+                    entry.Value.fileStatus = PlaybackInfo.Status.Incomplete;
+                    entry.Value.bytes = 0;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+                _ = Task.Run(SaveDB);
+        }
+
         public PlaybackInfo.Status AddRecord(PlaybackInfo record) {
             if (record == null) throw new ArgumentNullException("[PlaybackStore] Invalid Record");
-            if (!Store.ContainsKey(record.VideoId)) {
+
+            if (!Store.TryGetValue(record.VideoId, out var existing))
+            {
                 record.bytes = 0;
                 record.fileStatus = PlaybackInfo.Status.Incomplete;
-                Store.TryAdd(record.VideoId, record); 
+                Store.TryAdd(record.VideoId, record);
+                _ = Task.Run(SaveDB);
+                return record.fileStatus;
             }
+
+            existing.Title = record.Title;
+            existing.Artist = record.Artist;
+            existing.Source = record.Source;
+            existing.Channel = record.Channel;
+            existing.Album = record.Album;
+            existing.duration = record.duration;
             _ = Task.Run(SaveDB);
-            return Store[record.VideoId].fileStatus;
+            return existing.fileStatus;
         }
         public void SetStatus(string videoId, PlaybackInfo.Status status)
         {
@@ -115,8 +156,16 @@ $"""
 
         public async Task SaveDB()
         {
-            using (var f = File.Open(_filepath, FileMode.OpenOrCreate)) {
-                await f.WriteAsync(JsonSerializer.SerializeToUtf8Bytes(this.Store));
+            await _saveLock.WaitAsync();
+            try
+            {
+                var bytes = JsonSerializer.SerializeToUtf8Bytes(this.Store);
+                using var f = new FileStream(_filepath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                await f.WriteAsync(bytes);
+            }
+            finally
+            {
+                _saveLock.Release();
             }
         }
     }
